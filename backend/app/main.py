@@ -109,7 +109,19 @@ async def lifespan(app: FastAPI):
 
     # Start cache invalidation listener (only if Redis is connected)
     if redis_client.is_connected:
-        asyncio.create_task(cache_invalidation_listener())
+        _listener_task = asyncio.create_task(cache_invalidation_listener())
+
+        def _log_listener_done(task: asyncio.Task) -> None:
+            try:
+                exc = task.exception()
+            except asyncio.CancelledError:
+                return
+            if exc is not None:
+                logger.exception(
+                    "Cache invalidation listener crashed", exc_info=exc
+                )
+
+        _listener_task.add_done_callback(_log_listener_done)
         logger.info("🔄 Cache invalidation listener task created")
     else:
         logger.info("ℹ️ Redis not connected - cache invalidation will work locally only (single worker mode)")

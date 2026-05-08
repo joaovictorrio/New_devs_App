@@ -11,12 +11,18 @@ class Settings(BaseSettings):
     # Core settings
     database_url: str = "postgresql://postgres:postgres@db:5432/propertyflow"
     redis_url: str = "redis://redis:6379/0"
+    # SECURITY: secret_key MUST be provided via the SECRET_KEY env var in any
+    # non-development environment. The default below is intentionally an
+    # obvious placeholder so it can be detected and rejected at startup
+    # (see _validate_secrets below).
     secret_key: str = "debug_challenge_secret"
     
     # Optional legacy settings
     supabase_url: Optional[str] = None
     supabase_service_role_key: Optional[str] = None
     supabase_anon_key: Optional[str] = None
+    # SECURITY: same contract as secret_key — must be overridden in
+    # non-development environments via TOKEN_ENCRYPTION_KEY.
     token_encryption_key: str = "dummy_key_for_challenge_mode_only_123"
     environment: str = "development"
     n8n_verification_webhook_url: Optional[str] = None
@@ -74,7 +80,9 @@ class Settings(BaseSettings):
     
     # Application Settings
     app_name: str = "PropertyFlow Debug Challenge"
-    debug: bool = True
+    # Debug mode is OFF by default. Enable explicitly via DEBUG=true env var
+    # for local development; never enable in production.
+    debug: bool = os.getenv("DEBUG", "false").strip().lower() in ("1", "true", "yes", "on")
     
     # Optional fields for compatibility with existing imports
     frontend_url: str = "http://localhost:3000"
@@ -234,3 +242,45 @@ class Settings(BaseSettings):
 
 # Global settings instance
 settings = Settings()
+
+
+# ---------------------------------------------------------------------------
+# SECURITY: validate that placeholder secrets are NOT used outside of local
+# development. Hard-fail at import time so a misconfigured deploy refuses
+# to start instead of silently running with forge-able JWTs / fake encryption.
+# ---------------------------------------------------------------------------
+_PLACEHOLDER_SECRETS = {
+    "secret_key": "debug_challenge_secret",
+    "token_encryption_key": "dummy_key_for_challenge_mode_only_123",
+}
+_DEV_ENVIRONMENTS = {"development", "dev", "local", "test", "testing"}
+
+
+def _validate_secrets(s: "Settings") -> None:
+    env = (s.environment or "").strip().lower()
+    if env in _DEV_ENVIRONMENTS:
+        # In dev we tolerate the placeholders but warn loudly so it's obvious.
+        for field, placeholder in _PLACEHOLDER_SECRETS.items():
+            if getattr(s, field, None) == placeholder:
+                logger.warning(
+                    "SECURITY: %s is using the development placeholder value. "
+                    "This is acceptable in '%s' but MUST be overridden in production.",
+                    field.upper(), env,
+                )
+        return
+
+    # Non-development: any placeholder is a hard failure.
+    bad = [
+        field for field, placeholder in _PLACEHOLDER_SECRETS.items()
+        if getattr(s, field, None) == placeholder
+    ]
+    if bad:
+        raise RuntimeError(
+            "SECURITY: refusing to start in environment='{env}' with placeholder "
+            "secrets for: {fields}. Set them via environment variables.".format(
+                env=env or "<unset>", fields=", ".join(b.upper() for b in bad),
+            )
+        )
+
+
+_validate_secrets(settings)

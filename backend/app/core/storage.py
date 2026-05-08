@@ -4,6 +4,9 @@ Storage helper functions for Supabase storage buckets
 
 import logging
 from typing import Optional
+
+from fastapi import HTTPException, status
+
 from ..database import supabase
 
 logger = logging.getLogger(__name__)
@@ -34,9 +37,18 @@ async def upload_to_storage(bucket_name: str, file_path: str, file_content: byte
         
         return public_url
         
-    except Exception as e:
-        logger.error(f"Failed to upload to storage: {str(e)}")
+    except HTTPException:
         raise
+    except Exception as e:
+        # Don't surface internal storage errors to clients; log full detail
+        # and return a generic 502 (we depend on an external service).
+        logger.exception(
+            "Failed to upload to storage bucket=%s path=%s", bucket_name, file_path
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Storage upload failed",
+        ) from e
 
 async def delete_from_storage(bucket_name: str, file_path: str) -> bool:
     """
@@ -52,8 +64,10 @@ async def delete_from_storage(bucket_name: str, file_path: str) -> bool:
     try:
         response = supabase.storage.from_(bucket_name).remove([file_path])
         return True
-    except Exception as e:
-        logger.error(f"Failed to delete from storage: {str(e)}")
+    except Exception:
+        logger.exception(
+            "Failed to delete from storage bucket=%s path=%s", bucket_name, file_path
+        )
         return False
 
 async def get_storage_url(bucket_name: str, file_path: str) -> str:

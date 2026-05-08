@@ -8,11 +8,52 @@ import os
 from typing import Optional, Dict, Any
 from functools import lru_cache
 import asyncio
+import threading
 from app.services.token_manager_simple import get_token_manager
 import logging
 
 logger = logging.getLogger(__name__)
 
+
+def _run_coro_blocking(coro):
+    """Run an async coroutine from synchronous code, safely.
+
+    The previous implementation used ``asyncio.create_task(coro).result()``
+    which is broken: ``.result()`` on a not-yet-completed Task raises
+    ``InvalidStateError`` and you cannot block the running loop on itself.
+
+    Strategy:
+        * If we are NOT inside a running event loop, just use ``asyncio.run``.
+        * If we ARE inside a running loop, the caller is sync code that
+          needs an answer NOW — we run the coroutine on a dedicated worker
+          thread (with its own loop) and block this thread waiting for it.
+          That keeps the original event loop free.
+    """
+    try:
+        asyncio.get_running_loop()
+        running = True
+    except RuntimeError:
+        running = False
+
+    if not running:
+        return asyncio.run(coro)
+
+    # Inside an async context: hand off to a worker thread.
+    result_box: Dict[str, Any] = {}
+    error_box: Dict[str, Exception] = {}
+
+    def _worker() -> None:
+        try:
+            result_box["value"] = asyncio.run(coro)
+        except Exception as exc:  # noqa: BLE001 - propagated to caller
+            error_box["error"] = exc
+
+    t = threading.Thread(target=_worker, name="token-access-sync", daemon=True)
+    t.start()
+    t.join()
+    if "error" in error_box:
+        raise error_box["error"]
+    return result_box.get("value")
 
 class TokenAccess:
     """
@@ -186,23 +227,11 @@ class TokenAccess:
         """
         Get all Hostaway tokens (synchronous wrapper)
         Compatible with existing code
-        
+
         Returns:
             Dictionary of city -> token mappings
         """
-        loop = None
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # No event loop, create one
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            tokens = loop.run_until_complete(self._get_all_hostaway_tokens_async())
-            loop.close()
-            return tokens
-        else:
-            # Already in async context
-            return asyncio.create_task(self._get_all_hostaway_tokens_async()).result()
+        return _run_coro_blocking(self._get_all_hostaway_tokens_async())
     
     async def _get_all_hostaway_tokens_async(self) -> Dict[str, str]:
         """
@@ -257,65 +286,19 @@ class CompatibleSettings:
     
     def get_hostaway_token_for_city(self, city: str) -> Optional[str]:
         """Get Hostaway token for specific city (compatible with existing code)"""
-        loop = None
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # No event loop, create one
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            token = loop.run_until_complete(self._token_access.get_hostaway_token(city))
-            loop.close()
-            return token
-        else:
-            # Already in async context
-            future = asyncio.create_task(self._token_access.get_hostaway_token(city))
-            return asyncio.get_event_loop().run_until_complete(future)
+        return _run_coro_blocking(self._token_access.get_hostaway_token(city))
     
     @property
     def stripe_secret_key(self) -> Optional[str]:
         """Get Stripe secret key (compatible property)"""
-        loop = None
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            token = loop.run_until_complete(self._token_access.get_stripe_secret_key())
-            loop.close()
-            return token
-        else:
-            future = asyncio.create_task(self._token_access.get_stripe_secret_key())
-            return asyncio.get_event_loop().run_until_complete(future)
-    
+        return _run_coro_blocking(self._token_access.get_stripe_secret_key())
+
     @property
     def stripe_publishable_key(self) -> Optional[str]:
         """Get Stripe publishable key (compatible property)"""
-        loop = None
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            token = loop.run_until_complete(self._token_access.get_stripe_publishable_key())
-            loop.close()
-            return token
-        else:
-            future = asyncio.create_task(self._token_access.get_stripe_publishable_key())
-            return asyncio.get_event_loop().run_until_complete(future)
-    
+        return _run_coro_blocking(self._token_access.get_stripe_publishable_key())
+
     @property
     def stripe_webhook_secret(self) -> Optional[str]:
         """Get Stripe webhook secret (compatible property)"""
-        loop = None
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            token = loop.run_until_complete(self._token_access.get_stripe_webhook_secret())
-            loop.close()
-            return token
-        else:
-            future = asyncio.create_task(self._token_access.get_stripe_webhook_secret())
-            return asyncio.get_event_loop().run_until_complete(future)
+        return _run_coro_blocking(self._token_access.get_stripe_webhook_secret())

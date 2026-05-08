@@ -10,6 +10,7 @@ from ..database import supabase
 from ..models.auth import AuthenticatedUser, Permission
 from ..config import settings
 from .tenant_resolver import TenantResolver
+from .tenant_context import set_tenant_id, set_user_token
 
 logger = logging.getLogger(__name__)
 
@@ -38,15 +39,15 @@ def invalidate_user_cache(user_id: str):
     """
     global auth_cache
 
-    # Find all token hashes for this user
+    # Find all token hashes for this user (snapshot keys to avoid mutation during iteration)
     keys_to_delete = []
     for token_hash, cached_data in auth_cache.items():
         if cached_data.get("user") and cached_data["user"].id == user_id:
             keys_to_delete.append(token_hash)
 
-    # Delete found entries
+    # Delete found entries (use pop to be tolerant of concurrent deletes)
     for key in keys_to_delete:
-        del auth_cache[key]
+        auth_cache.pop(key, None)
 
     if keys_to_delete:
         logger.info(f"Invalidated {len(keys_to_delete)} cache entries for user {user_id}")
@@ -80,28 +81,33 @@ async def authenticate_request(
     # Create cache key from token hash (more secure than storing full token)
     token_hash = hashlib.sha256(token.encode()).hexdigest()[:16]
 
-    # Check cache first
-    if token_hash in auth_cache:
-        cached_data = auth_cache[token_hash]
+    # Check cache first (use .get to avoid TOCTOU on concurrent access)
+    cached_data = auth_cache.get(token_hash)
+    if cached_data is not None:
         if datetime.now().timestamp() - cached_data["timestamp"] < CACHE_DURATION:
             cached_user = cached_data["user"]
             # If not, force a refresh to get proper tenant isolation
             if not cached_user.tenant_id:
                 logger.warning(f"AUTH: Cached auth for {cached_user.email} missing tenant_id - forcing refresh")
-                del auth_cache[token_hash]
+                auth_cache.pop(token_hash, None)
             else:
                 logger.info(
                     f"AUTH: Using cached authentication for token {token_hash} (tenant: {cached_user.tenant_id}) for user: {cached_user.email}"
                 )
+                # Propagate tenant + user token into the request-scoped
+                # context so downstream code (RLS calls, scoped queries)
+                # sees the correct tenant for this request.
+                set_tenant_id(cached_user.tenant_id)
+                set_user_token(token)
                 return cached_user
         else:
             # Remove expired cache entry
-            del auth_cache[token_hash]
+            auth_cache.pop(token_hash, None)
 
-    logger.info(f"AUTH: Starting authentication - Token hash: {token_hash}, Token preview: {token[:20]}...")
+    logger.info(f"AUTH: Starting authentication - Token hash: {token_hash}")
 
     try:
-        logger.debug(f"AUTH: Verifying token with Supabase - Token: {token[:20]}...")
+        logger.debug(f"AUTH: Verifying token with Supabase (token hash={token_hash})")
 
         # Verify token - handle both Supabase tokens and custom JWT tokens
         try:
@@ -264,7 +270,21 @@ async def authenticate_request(
 
         if tenant_id and current_tenant_in_metadata != tenant_id:
             logger.info(f"Updating user metadata with tenant_id for future requests...")
-            asyncio.create_task(TenantResolver.update_user_tenant_metadata(user.id, tenant_id))
+            _metadata_task = asyncio.create_task(
+                TenantResolver.update_user_tenant_metadata(user.id, tenant_id)
+            )
+
+            def _log_metadata_update_done(task: asyncio.Task) -> None:
+                try:
+                    exc = task.exception()
+                except asyncio.CancelledError:
+                    return
+                if exc is not None:
+                    logger.warning(
+                        f"Background tenant metadata update failed: {exc}"
+                    )
+
+            _metadata_task.add_done_callback(_log_metadata_update_done)
 
         logger.info(f"==================== TENANT ID EXTRACTION END ====================")
 
@@ -283,11 +303,17 @@ async def authenticate_request(
             "timestamp": datetime.now().timestamp(),
         }
 
+        # Set request-scoped tenant context so downstream code (DB calls,
+        # RLS-aware queries, monitoring) sees the correct tenant.
+        if tenant_id:
+            set_tenant_id(tenant_id)
+        set_user_token(token)
+
         # Clean up old cache entries (keep cache size manageable)
         current_time = datetime.now().timestamp()
         expired_keys = [k for k, v in auth_cache.items() if current_time - v["timestamp"] > CACHE_DURATION]
         for key in expired_keys:
-            del auth_cache[key]
+            auth_cache.pop(key, None)
 
         duration = (datetime.now() - start_time).total_seconds()
         logger.info(

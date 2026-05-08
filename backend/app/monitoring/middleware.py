@@ -30,8 +30,12 @@ class PerformanceMonitoringMiddleware(BaseHTTPMiddleware):
             if hasattr(request.state, 'user'):
                 user_id = getattr(request.state.user, 'id', None)
                 tenant_id = getattr(request.state.user, 'tenant_id', None)
-        except:
-            pass
+        except AttributeError as exc:
+            # Defensive: request.state.user may not behave like expected.
+            # Log so we don't silently lose tenant attribution in metrics.
+            logger.debug(
+                "PerformanceMonitoring: could not extract user context: %s", exc
+            )
         
         # Process the request
         response = await call_next(request)

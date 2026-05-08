@@ -17,9 +17,14 @@ const Api = axios.create({
           throw new Error("No valid session. User must be logged in.");
         }
       const token = session.access_token;
-      config.headers['Authorization'] = `Bearer ${token}`; 
+      config.headers['Authorization'] = `Bearer ${token}`;
     } catch (error) {
-      console.error('Error fetching Cognito session:', error);
+      console.error('Error fetching auth session:', error);
+      // Propagate the error so the request is rejected instead of being
+      // sent unauthenticated. Sending requests without an Authorization
+      // header could leak data via misconfigured RLS or fall back to
+      // anonymous/service-role permissions.
+      throw error;
     }
     return config;
   },

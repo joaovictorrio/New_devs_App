@@ -249,12 +249,29 @@ async def get_users_optimized_query(tenant_id: str) -> List[Dict[str, Any]]:
         cities_task = asyncio.create_task(get_cities_batch(user_ids))
         auth_users_task = asyncio.create_task(get_auth_users_batch(user_ids, user_tenant_map))
         
-        # Wait for all queries to complete
-        permissions_map, cities_map, users_data = await asyncio.gather(
-            permissions_task,
-            cities_task,
-            auth_users_task
-        )
+        # Wait for all queries to complete (with overall timeout to avoid
+        # hanging the request indefinitely if a downstream query stalls).
+        try:
+            permissions_map, cities_map, users_data = await asyncio.wait_for(
+                asyncio.gather(
+                    permissions_task,
+                    cities_task,
+                    auth_users_task,
+                ),
+                timeout=15.0,
+            )
+        except asyncio.TimeoutError:
+            for task in (permissions_task, cities_task, auth_users_task):
+                if not task.done():
+                    task.cancel()
+            logger.error(
+                "Optimized users query timed out after 15s for tenant %s",
+                tenant_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail="Users query timed out",
+            )
         
         # Merge the data
         for user in users_data:
